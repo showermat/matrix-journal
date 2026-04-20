@@ -259,8 +259,8 @@ async fn login(session: &mut Session) -> Result<matrix_sdk::Client> {
 	Ok(client)
 }
 
-async fn initial_sync(client: &matrix_sdk::Client, session: &mut Session) -> Result<matrix_sdk::config::SyncSettings> {
-	let mut sync_settings = matrix_sdk::config::SyncSettings::default().filter(matrix_sdk::ruma::api::client::filter::FilterDefinition::with_lazy_loading().into());
+async fn initial_sync(client: &matrix_sdk::Client, session: &mut Session, filter: matrix_sdk::ruma::api::client::filter::FilterDefinition) -> Result<matrix_sdk::config::SyncSettings> {
+	let mut sync_settings = matrix_sdk::config::SyncSettings::default().filter(filter.into());
 	if let Some(token) = &session.sync_token {
 		sync_settings = sync_settings.token(token);
 	}
@@ -336,7 +336,6 @@ async fn main() -> Result<()> {
 		None => Box::new(std::io::stdout()),
 	};
 	let out = std::sync::Arc::new(std::sync::Mutex::new(raw_out));
-	let target_room = args.room.map(|room| matrix_sdk::ruma::RoomId::parse(room)).transpose()?;
 
 	let mut session = Session::load()?;
 	log::info!("Logging in as {}...", session.user);
@@ -350,11 +349,6 @@ async fn main() -> Result<()> {
 		let enqueue = enqueue.clone();
 		let out = out.clone();
 		async move |ev: IncomingEvent, room: &matrix_sdk::Room| {
-			if let Some(target) = target_room {
-				if room.room_id() != target { // TODO For more efficiency, pass a RoomFilter in the .filter() function on SyncSettings.
-					return;
-				}
-			}
 			if args.acknowledge {
 				if let Err(e) = room.send_single_receipt(matrix_sdk::ruma::api::client::receipt::create_receipt::v3::ReceiptType::Read, matrix_sdk::ruma::events::receipt::ReceiptThread::Unthreaded, ev.id().into()).await {
 					log::error!("Failed to update read markers: {}", e);
@@ -402,7 +396,12 @@ async fn main() -> Result<()> {
 	});
 
 	// Run initial sync and print sorted messages.
-	let mut sync_settings = initial_sync(&client, &mut session). await?;
+	let mut filter = matrix_sdk::ruma::api::client::filter::FilterDefinition::with_lazy_loading();
+	if let Some(room) = args.room {
+		let target_room = matrix_sdk::ruma::RoomId::parse(room)?;
+		filter.room.rooms = Some(vec![target_room]);
+	}
+	let mut sync_settings = initial_sync(&client, &mut session, filter). await?;
 	enqueue.store(false, std::sync::atomic::Ordering::Relaxed);
 	let mut locked_queue = sort_queue.lock().expect("Panic while holding sort queue lock");
 	while let Some(msg) = locked_queue.pop() { write_out(msg.0, args.json, &out); }
