@@ -184,7 +184,7 @@ impl IncomingEvent {
 }
 
 #[allow(unused)]
-#[derive(serde::Serialize)]
+#[derive(serde::Serialize, PartialEq, Eq)]
 struct Message {
 	id: String,
 	kind: String,
@@ -224,6 +224,18 @@ impl std::fmt::Display for Message {
 		if let Some(url) = &self.url { parts.push(url.to_string()); }
 		f.write_str(&parts.join(" | "))?;
 		Ok(())
+	}
+}
+
+impl std::cmp::Ord for Message {
+	fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+		self.ts.cmp(&other.ts)
+	}
+}
+
+impl std::cmp::PartialOrd for Message {
+	fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+		Some(self.ts.cmp(&other.ts))
 	}
 }
 
@@ -299,6 +311,17 @@ async fn verify_device(request: matrix_sdk::encryption::verification::Verificati
 	}
 }
 
+fn write_out(msg: Message, json: bool, out: &std::sync::Arc<std::sync::Mutex<Box<dyn std::io::Write + std::marker::Send + std::marker::Sync>>>) {
+	let content = match json {
+		true => serde_json::to_string(&msg).expect("Serialize failed"),
+		false => msg.to_string(),
+	};
+	if let Err(e) = writeln!(&mut out.lock().expect("Panic while holding output lock"), "{}", content) {
+		log::error!("Failed to write output: {}", e);
+	}
+}
+
+
 // Other events to consider watching:
 // https://docs.rs/matrix-sdk/latest/matrix_sdk/ruma/events/typing/type.TypingEvent.html
 // https://docs.rs/matrix-sdk/latest/matrix_sdk/ruma/events/presence/struct.PresenceEvent.html
@@ -319,33 +342,38 @@ async fn main() -> Result<()> {
 	log::info!("Logging in as {}...", session.user);
 	let client = login(&mut session).await?;
 
-	let handle_event = async move |ev: IncomingEvent, room: &matrix_sdk::Room| {
-		if let Some(target) = target_room {
-			if room.room_id() != target { // TODO For more efficiency, pass a RoomFilter in the .filter() function on SyncSettings.
-				return;
-			}
-		}
-		if args.acknowledge {
-			if let Err(e) = room.send_single_receipt(matrix_sdk::ruma::api::client::receipt::create_receipt::v3::ReceiptType::Read, matrix_sdk::ruma::events::receipt::ReceiptThread::Unthreaded, ev.id().into()).await {
-				log::error!("Failed to update read markers: {}", e);
-			}
-		}
+	let sort_queue = std::sync::Arc::new(std::sync::Mutex::new(std::collections::BinaryHeap::new()));
+	let enqueue = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
 
-		let msg = &Message {
-			id: ev.id().to_string(),
-			kind: ev.kind().to_string(),
-			ts: chrono::DateTime::from(ev.ts().to_system_time().expect("Couldn't convert timestamp to system time")),
-			room: room.display_name().await.map(|x| x.to_string()).unwrap_or(room.room_id().to_string()),
-			sender: room.get_member(ev.sender()).await.unwrap_or(None).map(|x| x.name().to_string()).unwrap_or("(unknown)".to_string()),
-			body: ev.body(),
-			url: ev.url(),
-		};
-		let output = match args.json {
-			true => serde_json::to_string(&msg).expect("Serialize failed"),
-			false => msg.to_string(),
-		};
-		if let Err(e) = writeln!(&mut out.lock().expect("Panic while holding output lock"), "{}", output) {
-			log::error!("Failed to write output: {}", e);
+	let handle_event = {
+		let sort_queue = sort_queue.clone();
+		let enqueue = enqueue.clone();
+		let out = out.clone();
+		async move |ev: IncomingEvent, room: &matrix_sdk::Room| {
+			if let Some(target) = target_room {
+				if room.room_id() != target { // TODO For more efficiency, pass a RoomFilter in the .filter() function on SyncSettings.
+					return;
+				}
+			}
+			if args.acknowledge {
+				if let Err(e) = room.send_single_receipt(matrix_sdk::ruma::api::client::receipt::create_receipt::v3::ReceiptType::Read, matrix_sdk::ruma::events::receipt::ReceiptThread::Unthreaded, ev.id().into()).await {
+					log::error!("Failed to update read markers: {}", e);
+				}
+			}
+
+			let msg = Message {
+				id: ev.id().to_string(),
+				kind: ev.kind().to_string(),
+				ts: chrono::DateTime::from(ev.ts().to_system_time().expect("Couldn't convert timestamp to system time")),
+				room: room.display_name().await.map(|x| x.to_string()).unwrap_or(room.room_id().to_string()),
+				sender: room.get_member(ev.sender()).await.unwrap_or(None).map(|x| x.name().to_string()).unwrap_or("(unknown)".to_string()),
+				body: ev.body(),
+				url: ev.url(),
+			};
+			match enqueue.load(std::sync::atomic::Ordering::Relaxed) {
+				true => sort_queue.lock().expect("Panic while holding sort queue lock").push(std::cmp::Reverse(msg)),
+				false => write_out(msg, args.json, &out),
+			};
 		}
 	};
 
@@ -373,10 +401,15 @@ async fn main() -> Result<()> {
 		tokio::spawn(verify_device(request));
 	});
 
-	// TODO Syncing can return events out of order.  It would be really nice to be able to sort these before presenting them to the user, but I don't think this is easily achievable in the current architecture.  The payoff may not be worth the effort at the moment.
+	// Run initial sync and print sorted messages.
 	let mut sync_settings = initial_sync(&client, &mut session). await?;
+	enqueue.store(false, std::sync::atomic::Ordering::Relaxed);
+	let mut locked_queue = sort_queue.lock().expect("Panic while holding sort queue lock");
+	while let Some(msg) = locked_queue.pop() { write_out(msg.0, args.json, &out); }
 	let sync_session = std::sync::Arc::new(std::sync::Mutex::new(session));
 	log::info!("Synced to latest room state.");
+
+	// Sync forever.
 	loop {
 		if let Some(ref token) = sync_session.lock().expect("Panic while holding session lock").sync_token {
 			sync_settings = sync_settings.token(token.clone());
