@@ -26,14 +26,13 @@ struct Args {
 	#[arg(short = 'o', long)]
 	out: Option<String>,
 
-	/// Whether to write each event as a single-line JSON object, rather than the default
-	/// plain text.
+	/// Whether to write each event as a single-line JSON object, rather than the default plain text.
 	#[arg(short = 'j', long)]
 	json: bool,
 }
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
-struct Session {
+struct Settings {
 	user: String,
 	password: Option<String>, // Can be unset once session is populated.
 	homeserver: String,
@@ -42,7 +41,7 @@ struct Session {
 	sync_token: Option<String>,
 }
 
-impl Session {
+impl Settings {
 	fn config_path() -> Result<std::path::PathBuf> {
 		Ok(xdg::BaseDirectories::with_prefix(APPNAME).place_data_file("session.json")?)
 	}
@@ -56,7 +55,12 @@ impl Session {
 	}
 
 	fn save(&self) -> Result<()> {
-		serde_json::to_writer(std::fs::File::create(&Self::config_path()?)?, &self)?;
+		// Write to a new file and rename, to avoid data loss if writing fails.
+		let path = Self::config_path()?;
+		let mut tmp_path = path.clone();
+		tmp_path.add_extension("new");
+		serde_json::to_writer(std::fs::File::create(&tmp_path)?, &self)?;
+		std::fs::rename(&tmp_path, &path)?;
 		Ok(())
 	}
 
@@ -239,39 +243,24 @@ impl std::cmp::PartialOrd for Message {
 	}
 }
 
-async fn login(session: &mut Session) -> Result<matrix_sdk::Client> {
-	let user = matrix_sdk::ruma::UserId::parse(&session.user)?;
+async fn login(settings: &mut Settings) -> Result<matrix_sdk::Client> {
+	let user = matrix_sdk::ruma::UserId::parse(&settings.user)?;
 	let client = matrix_sdk::Client::builder()
-		.homeserver_url(&session.homeserver)
-		.sqlite_store(Session::db_path()?, Some(&session.db_key))
+		.homeserver_url(&settings.homeserver)
+		.sqlite_store(Settings::db_path()?, Some(&settings.db_key))
 		.build().await?;
-	if let Some(session) = &session.session {
+	if let Some(session) = &settings.session {
 		client.restore_session(session.clone()).await?;
 	}
-	else if let Some(password) = &session.password {
+	else if let Some(password) = &settings.password {
 		client.matrix_auth().login_username(user, password).initial_device_display_name(APPNAME).await?;
-		session.session = Some(client.matrix_auth().session().expect("No session for logged-in client"));
-		session.save()?;
+		settings.session = Some(client.matrix_auth().session().expect("No session for logged-in client"));
+		settings.save()?;
 	}
 	else {
 		anyhow::bail!("No existing session, and no password set in the session file");
 	}
 	Ok(client)
-}
-
-async fn initial_sync(client: &matrix_sdk::Client, session: &mut Session, filter: matrix_sdk::ruma::api::client::filter::FilterDefinition) -> Result<matrix_sdk::config::SyncSettings> {
-	let mut sync_settings = matrix_sdk::config::SyncSettings::default().filter(filter.into());
-	if let Some(token) = &session.sync_token {
-		sync_settings = sync_settings.token(token);
-	}
-	loop {
-		if let Ok(response) = client.sync_once(sync_settings.clone()).await {
-			sync_settings = sync_settings.token(response.next_batch.clone());
-			session.update_sync_token(response.next_batch)?;
-			break;
-		}
-	}
-	Ok(sync_settings)
 }
 
 async fn verify_device(request: matrix_sdk::encryption::verification::VerificationRequest) {
@@ -321,7 +310,6 @@ fn write_out(msg: Message, json: bool, out: &std::sync::Arc<std::sync::Mutex<Box
 	}
 }
 
-
 // Other events to consider watching:
 // https://docs.rs/matrix-sdk/latest/matrix_sdk/ruma/events/typing/type.TypingEvent.html
 // https://docs.rs/matrix-sdk/latest/matrix_sdk/ruma/events/presence/struct.PresenceEvent.html
@@ -336,17 +324,24 @@ async fn main() -> Result<()> {
 		None => Box::new(std::io::stdout()),
 	};
 	let out = std::sync::Arc::new(std::sync::Mutex::new(raw_out));
+	let mut settings = Settings::load()?;
+	log::info!("Logging in as {}...", settings.user);
+	let client = login(&mut settings).await?;
 
-	let mut session = Session::load()?;
-	log::info!("Logging in as {}...", session.user);
-	let client = login(&mut session).await?;
+	let mut filter = matrix_sdk::ruma::api::client::filter::FilterDefinition::with_lazy_loading();
+	if let Some(room) = args.room {
+		let target_room = matrix_sdk::ruma::RoomId::parse(room)?;
+		filter.room.rooms = Some(vec![target_room]);
+	}
+	let mut sync_settings = matrix_sdk::config::SyncSettings::default().filter(filter.into());
+	let settings = std::sync::Arc::new(std::sync::Mutex::new(settings));
 
 	let sort_queue = std::sync::Arc::new(std::sync::Mutex::new(std::collections::BinaryHeap::new()));
-	let enqueue = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+	let should_enqueue = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
 
 	let handle_event = {
 		let sort_queue = sort_queue.clone();
-		let enqueue = enqueue.clone();
+		let should_enqueue = should_enqueue.clone();
 		let out = out.clone();
 		async move |ev: IncomingEvent, room: &matrix_sdk::Room| {
 			if args.acknowledge {
@@ -364,7 +359,7 @@ async fn main() -> Result<()> {
 				body: ev.body(),
 				url: ev.url(),
 			};
-			match enqueue.load(std::sync::atomic::Ordering::Relaxed) {
+			match should_enqueue.load(std::sync::atomic::Ordering::Relaxed) {
 				true => sort_queue.lock().expect("Panic while holding sort queue lock").push(std::cmp::Reverse(msg)),
 				false => write_out(msg, args.json, &out),
 			};
@@ -372,7 +367,7 @@ async fn main() -> Result<()> {
 	};
 
 	// Room events.
-	let handle_ev = handle_event.clone(); // TODO Ugh, how?
+	let handle_ev = handle_event.clone(); // Ugh, can we do better?
 	client.add_event_handler(|ev: matrix_sdk::ruma::events::room::message::SyncRoomMessageEvent, room: matrix_sdk::Room| async move {
 		handle_ev(IncomingEvent::Message(ev), &room).await;
 	});
@@ -395,30 +390,31 @@ async fn main() -> Result<()> {
 		tokio::spawn(verify_device(request));
 	});
 
-	// Run initial sync and print sorted messages.
-	let mut filter = matrix_sdk::ruma::api::client::filter::FilterDefinition::with_lazy_loading();
-	if let Some(room) = args.room {
-		let target_room = matrix_sdk::ruma::RoomId::parse(room)?;
-		filter.room.rooms = Some(vec![target_room]);
-	}
-	let mut sync_settings = initial_sync(&client, &mut session, filter). await?;
-	enqueue.store(false, std::sync::atomic::Ordering::Relaxed);
-	let mut locked_queue = sort_queue.lock().expect("Panic while holding sort queue lock");
-	while let Some(msg) = locked_queue.pop() { write_out(msg.0, args.json, &out); }
-	let sync_session = std::sync::Arc::new(std::sync::Mutex::new(session));
-	log::info!("Synced to latest room state.");
-
-	// Sync forever.
 	loop {
-		if let Some(ref token) = sync_session.lock().expect("Panic while holding session lock").sync_token {
+		if let Some(ref token) = settings.lock().expect("Panic while holding settings lock").sync_token {
 			sync_settings = sync_settings.token(token.clone());
 		}
+		// Fetch any messages that arrived while we were not listening, and sort them before printing.
+		should_enqueue.store(true, std::sync::atomic::Ordering::Relaxed);
+		loop {
+			if let Ok(response) = client.sync_once(sync_settings.clone()).await {
+				sync_settings = sync_settings.token(response.next_batch.clone());
+				settings.lock().expect("Panic while holding settings lock").update_sync_token(response.next_batch)?;
+				break;
+			}
+		}
+		should_enqueue.store(false, std::sync::atomic::Ordering::Relaxed);
+		let mut locked_queue = sort_queue.lock().expect("Panic while holding sort queue lock");
+		while let Some(msg) = locked_queue.pop() { write_out(msg.0, args.json, &out); }
+		log::info!("Synced to latest room state.");
+
+		// Listen for messages until we hit an error.
 		let res = client.sync_with_result_callback(sync_settings.clone(), |sync_result| {
-			let sync_session = sync_session.clone();
+			let settings = settings.clone();
 			async move {
 				let response = sync_result?;
-				sync_session.lock()
-					.expect("Panic while holding session lock")
+				settings.lock()
+					.expect("Panic while holding settings lock")
 					.update_sync_token(response.next_batch)
 					.map_err(|err| matrix_sdk::Error::UnknownError(err.into()))?;
 				Ok(matrix_sdk::LoopCtrl::Continue)
